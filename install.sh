@@ -70,7 +70,7 @@ is_conf_dir=$is_core_dir/conf
 is_log_dir=/var/log/$is_core
 is_sh_bin=/usr/local/bin/$is_core
 is_sh_dir=$is_core_dir/sh
-is_sh_repo=$author/$is_core
+is_sh_repo=blue2517/$is_core
 is_pkg="wget tar bash"
 # Alpine: gcompat provides glibc compatibility for prebuilt binaries
 [[ $cmd =~ apk ]] && is_pkg="$is_pkg gcompat jq"
@@ -448,9 +448,9 @@ main() {
     # create condf dir
     mkdir -p $is_conf_dir
 
-    load core.sh
-    # create a config
-    add hy2
+    # Use the installed entry point to initialize all protocol dependencies
+    # and let the user choose the first protocol (no default).
+    is_new_install=1 is_ntp_on="$is_ntp_on" "$is_sh_bin" add || exit_and_del_tmpdir
     # wait for background tasks (e.g., OpenRC service start)
     wait
     # remove tmp dir and exit.

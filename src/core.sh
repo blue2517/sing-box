@@ -68,6 +68,13 @@ info_list=(
     "用户名 (Username)"
     "跳过证书验证 (allowInsecure)"
     "拥塞控制算法 (congestion_control)"
+    "混淆 (obfs)"
+    "跳跃端口 (mport)"
+    "伪装网站 (masquerade)"
+    "链式出站 (chain)"
+    "直连例外 (bypass)"
+    "证书路径 (cert)"
+    "Short ID (sid)"
 )
 change_list=(
     "更改协议"
@@ -83,6 +90,10 @@ change_list=(
     "更改 SNI (serverName)"
     "更改伪装网站"
     "更改用户名 (Username)"
+    "链式代理 (SOCKS5)"
+    "更改混淆 (Salamander)"
+    "更改证书 (Cert)"
+    "UDP 端口跳跃 (Hopping)"
 )
 servername_list=(
     www.amazon.com
@@ -312,6 +323,142 @@ ask() {
     unset is_opt_msg is_opt_input_msg is_tmp_list is_ask_result is_default_arg is_emtpy_exit
 }
 
+is_external_caddy() {
+    if [[ -s $is_caddyfile ]] && ! grep -qE "^# don't edit this file #$|^# 不要编辑这个文件 #$|233boy\.com/.*/caddy-auto-tls/" "$is_caddyfile"; then
+        return 0
+    fi
+    if [[ ! $is_caddy ]] && [[ -x /usr/bin/caddy || -n $is_caddy_service ]]; then
+        return 0
+    fi
+    return 1
+}
+
+ensure_default_tls_pair() {
+    is_tls_cer=$is_core_dir/bin/tls.cer
+    is_tls_key=$is_core_dir/bin/tls.key
+    if [[ ! -f $is_tls_cer || ! -f $is_tls_key ]]; then
+        local is_tls_tmp=${is_tls_key/key/tmp}
+        $is_core_bin generate tls-keypair tls -m 456 >"$is_tls_tmp"
+        awk '/BEGIN PRIVATE KEY/,/END PRIVATE KEY/' "$is_tls_tmp" >"$is_tls_key"
+        awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' "$is_tls_tmp" >"$is_tls_cer"
+        rm -f "$is_tls_tmp"
+    fi
+}
+
+derive_reality_pbk() {
+    local priv=$1
+    [[ -z $priv ]] && return
+    command -v openssl &>/dev/null || return
+    local b64
+    b64=$(printf '%s' "$priv" | tr -- '-_' '+/')
+    case $(( ${#b64} % 4 )) in
+    2) b64="${b64}==" ;;
+    3) b64="${b64}=" ;;
+    esac
+    is_public_key=$(
+        (printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x6e\x04\x22\x04\x20'; printf '%s' "$b64" | base64 -d 2>/dev/null) |
+            openssl pkey -inform DER -pubout -outform DER 2>/dev/null |
+            tail -c 32 | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '='
+    )
+}
+
+_validate_singbox_config() {
+    [[ ! -x $is_core_bin || ! -f $is_config_json ]] && return 0
+    "$is_core_bin" check -c "$is_config_json" -C "$is_conf_dir" &>/dev/null
+}
+
+_commit_config_json() {
+    local target=$1 content=$2 backup=$3 mode=$4
+    [[ -z $content ]] && {
+        [[ -f $backup ]] && rm -f "$backup"
+        err "生成配置失败: JSON 内容为空."
+    }
+    local orig_mode=""
+    [[ -f $backup ]] && orig_mode=$(stat -c '%a' "$backup" 2>/dev/null)
+    printf '%s\n' "$content" >"$target"
+    if [[ -n $mode ]]; then
+        chmod "$mode" "$target"
+    elif [[ $orig_mode == "600" ]] || jq -e '(.inbounds[0].type == "socks") or any(.outbounds[]?; .type != "direct" and .type != null)' "$target" &>/dev/null; then
+        chmod 600 "$target"
+    fi
+    if ! _validate_singbox_config; then
+        local check_err
+        check_err=$("$is_core_bin" check -c "$is_config_json" -C "$is_conf_dir" 2>&1)
+        [[ -f $backup ]] && mv -f "$backup" "$target"
+        err "sing-box 配置校验失败, 已自动回滚:\n$check_err"
+    fi
+    [[ -f $backup ]] && rm -f "$backup"
+}
+
+_patch_existing_server_json() {
+    local old_file="$is_conf_dir/$is_orig_config_file"
+    local old_tag target_tag
+    old_tag=$(jq -r --arg d "$is_orig_config_file" '.inbounds[0].tag // $d' "$old_file")
+    if [[ $old_tag == "$is_orig_config_file" ]]; then
+        target_tag="$is_config_name"
+    else
+        # Preserve custom user-defined inbound tag (may be referenced by config.json route.rules)
+        target_tag="$old_tag"
+    fi
+
+    is_new_json=$(jq \
+        --arg old_tag "$old_tag" \
+        --arg new_tag "$target_tag" \
+        --arg proto "$is_protocol" \
+        --arg port "$port" \
+        --arg uuid "$uuid" \
+        --arg password "$password" \
+        --arg ss_method "$ss_method" \
+        --arg ss_password "$ss_password" \
+        --arg socks_user "$is_socks_user" \
+        --arg socks_pass "$is_socks_pass" \
+        --arg door_addr "$door_addr" \
+        --arg door_port "$door_port" \
+        --arg path "$path" \
+        --arg host "$host" \
+        --arg is_reality "$is_reality" \
+        --arg sni "$is_servername" \
+        --arg priv "$is_private_key" \
+        --arg pub "$is_public_key" '
+      .inbounds[0].tag = $new_tag |
+      .inbounds[0].listen_port = ($port | tonumber) |
+      (if $old_tag != $new_tag and (.route.rules | type) == "array" then
+        .route.rules |= map(if (.inbound | type) == "array" then .inbound |= map(if . == $old_tag then $new_tag else . end) else . end)
+      else . end) |
+      (if $proto == "vmess" or $proto == "vless" then
+        .inbounds[0].users[0].uuid = $uuid
+      elif $proto == "tuic" then
+        .inbounds[0].users[0].uuid = $uuid |
+        .inbounds[0].users[0].password = $password
+      elif $proto == "trojan" or $proto == "hysteria2" or $proto == "anytls" then
+        .inbounds[0].users[0].password = $password
+      elif $proto == "shadowsocks" then
+        .inbounds[0].method = $ss_method |
+        .inbounds[0].password = $ss_password
+      elif $proto == "socks" then
+        .inbounds[0].users[0].username = $socks_user |
+        .inbounds[0].users[0].password = $socks_pass
+      elif $proto == "direct" then
+        .inbounds[0].override_address = $door_addr |
+        .inbounds[0].override_port = ($door_port | tonumber)
+      else . end) |
+      (if ($path | length) > 0 and (.inbounds[0].transport | type) == "object" then
+        .inbounds[0].transport.path = $path
+      else . end) |
+      (if ($host | length) > 0 and (.inbounds[0].transport | type) == "object" then
+        .inbounds[0].transport.headers.host = $host
+      else . end) |
+      (if ($is_reality | length) > 0 then
+        .inbounds[0].tls.server_name = $sni |
+        .inbounds[0].tls.reality.handshake.server = $sni |
+        .inbounds[0].tls.reality.private_key = $priv |
+        if (.outbounds | type) == "array" then
+          .outbounds |= map(if ((.tag // "") | startswith("public_key_")) then .tag = ("public_key_" + $pub) else . end)
+        else . end
+      else . end)
+    ' "$old_file") || err "增量更新配置失败: $is_orig_config_file"
+}
+
 # create file
 create() {
     case $1 in
@@ -329,9 +476,64 @@ create() {
         else
             is_config_name=$2-${port}.json
         fi
-        is_json_file=$is_conf_dir/$is_config_name
         # get json
         [[ $is_change || ! $json_str ]] && get protocol $2
+        if [[ $is_change && ! $is_set_new_protocol && $is_orig_config_file && -f $is_conf_dir/$is_orig_config_file ]]; then
+            if [[ $host && $old_host && $host != $old_host ]]; then
+                is_config_name=$2-${host}.json
+            elif [[ $is_orig_port && $port != $is_orig_port && $is_orig_config_file == *"-${is_orig_port}.json" ]]; then
+                is_config_name="${is_orig_config_file%-${is_orig_port}.json}-${port}.json"
+            else
+                is_config_name="$is_orig_config_file"
+            fi
+            is_json_file=$is_conf_dir/$is_config_name
+            _patch_existing_server_json
+            [[ $is_test_json ]] && return
+            [[ $is_gen ]] && {
+                msg
+                jq <<<$is_new_json
+                msg
+                return
+            }
+            local old_file="$is_conf_dir/$is_orig_config_file"
+            local backup_file
+            backup_file=$(mktemp)
+            cp -pf "$old_file" "$backup_file"
+            if [[ $is_json_file != $old_file ]]; then
+                local orig_mode
+                orig_mode=$(stat -c '%a' "$backup_file" 2>/dev/null)
+                printf '%s\n' "$is_new_json" >"$is_json_file"
+                if [[ $orig_mode == "600" ]] || jq -e '(.inbounds[0].type == "socks") or any(.outbounds[]?; .type != "direct" and .type != null)' "$is_json_file" &>/dev/null; then
+                    chmod 600 "$is_json_file"
+                fi
+                rm -f "$old_file"
+                if ! _validate_singbox_config; then
+                    local check_err
+                    check_err=$("$is_core_bin" check -c "$is_config_json" -C "$is_conf_dir" 2>&1)
+                    mv -f "$backup_file" "$old_file"
+                    rm -f "$is_json_file"
+                    err "sing-box 配置校验失败, 已自动回滚:\n$check_err"
+                fi
+                rm -f "$backup_file"
+            else
+                _commit_config_json "$is_json_file" "$is_new_json" "$backup_file"
+            fi
+            if [[ $is_protocol == 'hysteria2' && $is_orig_port && $port != $is_orig_port ]]; then
+                load hy2.sh
+                hy2_update_hopping_port "$is_orig_port" "$port" "$is_config_name"
+            fi
+            if [[ $is_caddy && $old_host && $host != $old_host && -f $is_caddy_conf/$old_host.conf ]]; then
+                rm -rf "$is_caddy_conf/$old_host.conf" "$is_caddy_conf/$old_host.conf.add"
+            fi
+            [[ $is_caddy && $host && ! $is_no_auto_tls ]] && {
+                create caddy $net
+            }
+            [[ $is_dont_auto_exit ]] && unset is_config_file
+            manage restart &
+            return
+        fi
+
+        is_json_file=$is_conf_dir/$is_config_name
         [[ $net == "reality" ]] && is_add_public_key=",outbounds:[{type:\"direct\"},{tag:\"public_key_$is_public_key\",type:\"direct\"}]"
         is_new_json=$(jq "{inbounds:[{tag:\"$is_config_name\",type:\"$is_protocol\",$is_listen,listen_port:$port,$json_str}]$is_add_public_key}" <<<{})
         [[ $is_test_json ]] && return # tmp test
@@ -346,6 +548,7 @@ create() {
         [[ $is_config_file ]] && is_no_del_msg=1 && del $is_config_file
         # save json to file
         cat <<<$is_new_json >$is_json_file
+        [[ $is_protocol == "socks" || $is_hy2_add_obfs ]] && chmod 600 "$is_json_file"
         if [[ $is_new_install ]]; then
             # config.json
             create config.json
@@ -369,6 +572,9 @@ create() {
         ;;
     caddy)
         load caddy.sh
+        if ! is_script_caddyfile; then
+            err "检测到现有 Caddyfile 非本脚本生成（可能为独立业务网关），已禁止修改: $is_caddyfile"
+        fi
         [[ $is_install_caddy ]] && caddy_config new
         [[ ! $(grep "$is_caddy_conf" $is_caddyfile) ]] && {
             msg "import $is_caddy_conf/*.conf" >>$is_caddyfile
@@ -378,17 +584,34 @@ create() {
         manage restart caddy &
         ;;
     config.json)
-        is_log='log:{output:"/var/log/'$is_core'/access.log",level:"info","timestamp":true}'
-        is_dns='dns:{}'
-        is_ntp='ntp:{"enabled":true,"server":"time.apple.com"},'
-        if [[ -f $is_config_json ]]; then
-            [[ $(jq .ntp.enabled $is_config_json) != "true" ]] && is_ntp=
+        local log_file="/var/log/$is_core/access.log"
+        if [[ -s $is_config_json ]] && jq empty "$is_config_json" &>/dev/null; then
+            is_server_config_json=$(jq --arg log_file "$log_file" '
+              .log = (.log // {output: $log_file, level: "info", timestamp: true}) |
+              .dns = (.dns // {}) |
+              .outbounds = (
+                if (.outbounds | type) == "array" and (.outbounds | length) > 0 then
+                  if any(.outbounds[]; .tag == "direct") then .outbounds else .outbounds + [{tag: "direct", type: "direct"}] end
+                else
+                  [{tag: "direct", type: "direct"}]
+                end
+              ) |
+              .route = ((.route // {}) | if (.final // null) == null then .final = "direct" else . end)
+            ' "$is_config_json") || err "合并主配置文件失败: $is_config_json"
         else
-            [[ ! $is_ntp_on ]] && is_ntp=
+            local ntp_json="null"
+            [[ $is_ntp_on ]] && ntp_json='{"enabled":true,"server":"time.apple.com"}'
+            is_server_config_json=$(jq -n --arg log_file "$log_file" --argjson ntp "$ntp_json" '
+              {
+                log: {output: $log_file, level: "info", timestamp: true},
+                dns: {},
+                outbounds: [{tag: "direct", type: "direct"}],
+                route: {final: "direct"}
+              } + (if $ntp != null then {ntp: $ntp} else {} end)
+            ') || err "生成主配置文件失败: $is_config_json"
         fi
-        is_outbounds='outbounds:[{tag:"direct",type:"direct"}]'
-        is_server_config_json=$(jq "{$is_log,$is_dns,$is_ntp$is_outbounds}" <<<{})
-        cat <<<$is_server_config_json >$is_config_json
+        [[ -z $is_server_config_json ]] && err "生成主配置文件失败: 输出为空."
+        printf '%s\n' "$is_server_config_json" >"$is_config_json"
         manage restart &
         ;;
     esac
@@ -436,8 +659,23 @@ change() {
         sni | servername | servernames)
             is_change_id=10
             ;;
-        web | proxy-site)
+        web | proxy-site | masquerade)
             is_change_id=11
+            ;;
+        user | username)
+            is_change_id=12
+            ;;
+        chain)
+            is_change_id=13
+            ;;
+        obfs | hy2-obfs)
+            is_change_id=14
+            ;;
+        cert)
+            is_change_id=15
+            ;;
+        hop | hopping | mport)
+            is_change_id=16
             ;;
         *)
             [[ $is_try_change ]] && return
@@ -581,30 +819,23 @@ change() {
             get_pbk
             add $net
         else
-            [[ $is_new_private_key && ! $is_new_public_key ]] && {
-                err "无法找到 Public key."
-            }
             [[ ! $is_new_private_key ]] && ask string is_new_private_key "请输入新 Private key:"
+            if [[ ! $is_new_public_key ]]; then
+                derive_reality_pbk "$is_new_private_key"
+                is_new_public_key=$is_public_key
+            fi
             [[ ! $is_new_public_key ]] && ask string is_new_public_key "请输入新 Public key:"
             if [[ $is_new_private_key == $is_new_public_key ]]; then
                 err "Private key 和 Public key 不能一样."
             fi
-            is_tmp_json=$is_conf_dir/$is_config_file-$uuid
-            cp -f $is_conf_dir/$is_config_file $is_tmp_json
-            sed -i s#$is_private_key #$is_new_private_key# $is_tmp_json
-            $is_core_bin check -c $is_tmp_json &>/dev/null
-            if [[ $? != 0 ]]; then
-                is_key_err=1
-                is_key_err_msg="Private key 无法通过测试."
+            local is_tmp_json
+            is_tmp_json=$(mktemp --suffix=.json 2>/dev/null || mktemp)
+            jq --arg priv "$is_new_private_key" '.inbounds[0].tls.reality.private_key = $priv | del(.route)' "$is_conf_dir/$is_config_file" >"$is_tmp_json"
+            if ! $is_core_bin check -c "$is_tmp_json" &>/dev/null; then
+                rm -f "$is_tmp_json"
+                err "Private key 无法通过测试."
             fi
-            sed -i s#$is_new_private_key #$is_new_public_key# $is_tmp_json
-            $is_core_bin check -c $is_tmp_json &>/dev/null
-            if [[ $? != 0 ]]; then
-                is_key_err=1
-                is_key_err_msg+="Public key 无法通过测试."
-            fi
-            rm $is_tmp_json
-            [[ $is_key_err ]] && err $is_key_err_msg
+            rm -f "$is_tmp_json"
             is_private_key=$is_new_private_key
             is_public_key=$is_new_public_key
             is_test_json=
@@ -624,7 +855,12 @@ change() {
         add $net
         ;;
     11)
-        # new proxy site
+        # new proxy site / Hysteria2 masquerade
+        if [[ $is_protocol == 'hysteria2' ]]; then
+            load hy2.sh
+            hy2_set_web "$is_config_file" "$3"
+            return
+        fi
         is_new_proxy_site=$3
         [[ ! $is_caddy && ! $host ]] && {
             err "($is_config_file) 不支持更改伪装网站."
@@ -647,6 +883,26 @@ change() {
         ask string is_socks_user "请输入新用户名 (Username):"
         add $net
         ;;
+    13)
+        # chain socks5
+        load chain.sh
+        chain_set "$is_config_file" "$3" "$4"
+        ;;
+    14)
+        # hy2 salamander obfs
+        load hy2.sh
+        hy2_set_obfs "$is_config_file" "$3"
+        ;;
+    15)
+        # hy2 custom cert
+        load hy2.sh
+        hy2_set_cert "$is_config_file" "$3" "$4" "$5"
+        ;;
+    16)
+        # hy2 port hopping
+        load hy2.sh
+        hy2_set_hop "$is_config_file" "$3"
+        ;;
     esac
 }
 
@@ -663,6 +919,10 @@ del() {
             pause
         fi
         rm -rf $is_conf_dir/"$is_config_file"
+        if [[ $is_protocol == 'hysteria2' && ! $is_new_json && $port ]]; then
+            load hy2.sh
+            hy2_remove_hopping_by_port "$port"
+        fi
         [[ ! $is_new_json ]] && manage restart &
         [[ ! $is_no_del_msg ]] && _green "\n已删除: $is_config_file\n"
 
@@ -683,28 +943,32 @@ del() {
         is_conf_dir_empty=1
     fi
     unset is_dont_get_ip
-    [[ $is_dont_auto_exit ]] && unset is_config_file
+    if [[ $is_dont_auto_exit ]]; then unset is_config_file; fi
 }
 
 # uninstall
 uninstall() {
-    if [[ $is_caddy ]]; then
+    if [[ $is_caddy ]] && ! is_external_caddy; then
         is_tmp_list=("卸载 $is_core_name" "卸载 ${is_core_name} & Caddy")
         ask list is_do_uninstall
     else
         ask string y "是否卸载 ${is_core_name}? [y]:"
     fi
+    [[ -x $is_core_dir/hy2-port-hopping.sh ]] && "$is_core_dir/hy2-port-hopping.sh" stop 2>/dev/null || true
+    rm -f "/etc/systemd/system/${is_core}.service.d/hy2-hopping.conf"
+    rmdir "/etc/systemd/system/${is_core}.service.d" 2>/dev/null || true
     manage stop &>/dev/null
     manage disable &>/dev/null
     rm -rf $is_core_dir $is_log_dir $is_sh_bin ${is_sh_bin/$is_core/sb}
     if [[ $is_systemd ]]; then
         rm -f /lib/systemd/system/$is_core.service
+        systemctl daemon-reload 2>/dev/null || true
     elif [[ $is_openrc ]]; then
         rm -f /etc/init.d/$is_core
     fi
     sed -i "/$is_core/d" /root/.bashrc
     # uninstall caddy; 2 is ask result
-    if [[ $REPLY == '2' ]]; then
+    if [[ $REPLY == '2' ]] && ! is_external_caddy; then
         manage stop caddy &>/dev/null
         manage disable caddy &>/dev/null
         if [[ $is_systemd ]]; then
@@ -993,6 +1257,9 @@ add() {
 
     if [[ $is_use_tls ]]; then
         if [[ ! $is_no_auto_tls && ! $is_caddy && ! $is_gen && ! $is_dont_test_host ]]; then
+            if is_external_caddy; then
+                err "检测到系统已存在非本脚本管理的 Caddy / Caddyfile，已禁止自动安装或覆写 Caddy。\n如仅需配置 TLS 入站请使用: $is_core no-auto-tls ..."
+            fi
             # test auto tls
             [[ $(is_test port_used 80) || $(is_test port_used 443) ]] && {
                 get_port
@@ -1030,6 +1297,27 @@ add() {
                 [[ ! $ss_method ]] && ask set_ss_method
                 # set password
                 [[ ! $ss_password ]] && ask string ss_password "请设置密码:"
+                ;;
+            hysteria2)
+                echo -ne "可选: 设置 Salamander 混淆密码 (输入 auto 随机生成, 直接回车跳过): "
+                read -r is_hy2_add_obfs
+                [[ ${is_hy2_add_obfs,,} == "auto" ]] && is_hy2_add_obfs=$(tr -dc 'A-Za-z0-9_-' </dev/urandom | head -c 32)
+                echo -ne "可选: 设置伪装网站 URL (如 https://guizi.asia/, 直接回车跳过): "
+                read -r is_hy2_add_masquerade
+                [[ -n $is_hy2_add_masquerade && ! $is_hy2_add_masquerade =~ ^https?:// ]] && is_hy2_add_masquerade="https://${is_hy2_add_masquerade}"
+                echo -ne "可选: 自定义证书路径 (.crt/.pem, 直接回车使用自签名证书): "
+                read -r is_hy2_add_cert
+                if [[ -n $is_hy2_add_cert ]]; then
+                    [[ ! -f $is_hy2_add_cert ]] && err "找不到证书文件: $is_hy2_add_cert"
+                    ask string is_hy2_add_key "请输入私钥路径 (.key):"
+                    [[ ! -f $is_hy2_add_key ]] && err "找不到私钥文件: $is_hy2_add_key"
+                    if command -v openssl &>/dev/null; then
+                        is_hy2_add_sni=$(openssl x509 -noout -ext subjectAltName -in "$is_hy2_add_cert" 2>/dev/null | grep -oE 'DNS:[^, ]+' | head -n1 | sed 's/^DNS://')
+                    fi
+                    [[ ! $is_hy2_add_sni ]] && ask string is_hy2_add_sni "请输入证书对应域名 (SNI):"
+                fi
+                echo -ne "可选: UDP 端口跳跃范围 (如 20000-20099, 直接回车跳过): "
+                read -r is_hy2_add_hop
                 ;;
             esac
 
@@ -1074,6 +1362,12 @@ add() {
     # create json
     create server $is_new_protocol
 
+    if [[ $is_hy2_add_hop && ! $is_gen ]]; then
+        load hy2.sh
+        hy2_set_hop "$is_config_name" "$is_hy2_add_hop"
+        return
+    fi
+
     # show config info.
     info
 }
@@ -1108,35 +1402,79 @@ get() {
         }
         ;;
     info)
+        unset is_protocol port uuid password username ss_method ss_password door_port door_addr net_type path host is_servername is_private_key is_public_key is_reality is_socks is_socks_user is_socks_pass is_anytls_domain is_reality_sid is_hy2_obfs_type is_hy2_obfs_pass is_hy2_cert is_hy2_key is_hy2_masquerade is_hy2_hop is_chain_summary is_chain_bypass is_no_auto_tls is_tmp_https_port is_orig_config_file is_orig_port
         get file $2
         if [[ $is_config_file ]]; then
-            is_json_str=$(cat $is_conf_dir/"$is_config_file" | sed s#//.*##)
-            is_json_data=$(jq '(.inbounds[0]|.type,.listen_port,(.users[0]|.uuid,.password,.username),.method,.password,.override_port,.override_address,(.transport|.type,.path,.headers.host),(.tls|.server_name,.reality.private_key)),(.outbounds[1].tag)' <<<$is_json_str)
+            is_orig_config_file=$is_config_file
+            if jq empty "$is_conf_dir/$is_config_file" &>/dev/null; then
+                is_json_str=$(cat "$is_conf_dir/$is_config_file")
+            else
+                is_json_str=$(sed -E 's#^[[:space:]]*//.*##' "$is_conf_dir/$is_config_file")
+            fi
+            is_json_data=$(jq -r '
+              [
+                .inbounds[0].type,
+                .inbounds[0].listen_port,
+                .inbounds[0].users[0].uuid,
+                .inbounds[0].users[0].password,
+                .inbounds[0].users[0].username,
+                .inbounds[0].method,
+                .inbounds[0].password,
+                .inbounds[0].override_port,
+                .inbounds[0].override_address,
+                .inbounds[0].transport.type,
+                .inbounds[0].transport.path,
+                .inbounds[0].transport.headers.host,
+                .inbounds[0].tls.server_name,
+                .inbounds[0].tls.reality.private_key,
+                ([.outbounds[]?.tag? // empty | select(startswith("public_key_"))] | .[0] // null)
+              ] | .[] | if . == null or . == "" then "null" else tostring end
+            ' <<<"$is_json_str")
             [[ $? != 0 ]] && err "无法读取此文件: $is_config_file"
             is_up_var_set=(null is_protocol port uuid password username ss_method ss_password door_port door_addr net_type path host is_servername is_private_key is_public_key)
             [[ $is_debug ]] && msg "\n------------- debug: $is_config_file -------------"
-            i=0
-            for v in $(sed 's/""/null/g;s/"//g' <<<"$is_json_data"); do
-                ((i++))
-                [[ $is_debug ]] && msg "$i-${is_up_var_set[$i]}: $v"
-                export ${is_up_var_set[$i]}="${v}"
+            local is_parsed_vals=()
+            mapfile -t is_parsed_vals <<<"$is_json_data"
+            for ((i = 0; i < ${#is_parsed_vals[@]}; i++)); do
+                local v=${is_parsed_vals[$i]}
+                local k=${is_up_var_set[$((i + 1))]}
+                [[ $is_debug ]] && msg "$((i + 1))-${k}: $v"
+                export "$k"="$v"
             done
             for v in ${is_up_var_set[@]}; do
                 [[ ${!v} == 'null' ]] && unset $v
             done
 
+            is_orig_port=$port
             if [[ $is_private_key ]]; then
                 is_reality=1
                 net_type+=reality
                 is_public_key=${is_public_key/public_key_/}
+                if [[ ! $is_public_key ]]; then
+                    derive_reality_pbk "$is_private_key"
+                fi
+                is_reality_sid=$(jq -r '.inbounds[0].tls.reality.short_id[0] // empty' <<<"$is_json_str" 2>/dev/null)
             fi
             is_socks_user=$username
             is_socks_pass=$password
 
             # extract anytls ACME domain
             [[ $is_protocol == 'anytls' ]] && {
-                is_anytls_domain=$(jq -r '(.inbounds[0].tls.certificate_provider.domain[0] // .inbounds[0].tls.acme.domain[0]) // empty' <<<$is_json_str 2>/dev/null)
+                is_anytls_domain=$(jq -r '(.inbounds[0].tls.certificate_provider.domain[0] // .inbounds[0].tls.acme.domain[0]) // empty' <<<"$is_json_str" 2>/dev/null)
             }
+
+            # extract Hysteria2 extra fields
+            [[ $is_protocol == 'hysteria2' ]] && {
+                is_hy2_obfs_type=$(jq -r '.inbounds[0].obfs.type // empty' <<<"$is_json_str" 2>/dev/null)
+                is_hy2_obfs_pass=$(jq -r '.inbounds[0].obfs.password // empty' <<<"$is_json_str" 2>/dev/null)
+                is_hy2_cert=$(jq -r '.inbounds[0].tls.certificate_path // empty' <<<"$is_json_str" 2>/dev/null)
+                is_hy2_key=$(jq -r '.inbounds[0].tls.key_path // empty' <<<"$is_json_str" 2>/dev/null)
+                is_hy2_masquerade=$(jq -r '(.inbounds[0].masquerade | if type == "object" then .url else . end) // empty' <<<"$is_json_str" 2>/dev/null)
+            }
+
+            # extract chain outbounds & bypass rules
+            is_chain_summary=$(jq -r '([.outbounds[]? | select(.type != "direct" and ((.tag // "") | startswith("public_key_") | not)) | "\(.tag) (\(.type)://\(.server):\(.server_port))"] | join(", ")) // empty' <<<"$is_json_str" 2>/dev/null)
+            is_chain_bypass=$(jq -r '([.route.rules[]? | select(.outbound == "direct") | (.domain_suffix // [])[]] | join(", ")) // empty' <<<"$is_json_str" 2>/dev/null)
 
             is_config_name=$is_config_file
 
@@ -1157,15 +1495,7 @@ get() {
         net=
         is_users="users:[{uuid:\"$uuid\"}]"
         # tmp tls key
-        is_tls_cer=$is_core_dir/bin/tls.cer
-        is_tls_key=$is_core_dir/bin/tls.key
-        [[ ! -f $is_tls_cer || ! -f $is_tls_key ]] && {
-            is_tls_tmp=${is_tls_key/key/tmp}
-            $is_core_bin generate tls-keypair tls -m 456 >$is_tls_tmp
-            awk '/BEGIN PRIVATE KEY/,/END PRIVATE KEY/' $is_tls_tmp >$is_tls_key
-            awk '/BEGIN CERTIFICATE/,/END CERTIFICATE/' $is_tls_tmp >$is_tls_cer
-            rm $is_tls_tmp
-        }
+        ensure_default_tls_pair
         is_tls_json='tls:{enabled:true,alpn:["h3"],key_path:"'$is_tls_key'",certificate_path:"'$is_tls_cer'"}'
         case $is_lower in
         vmess*)
@@ -1195,7 +1525,24 @@ get() {
             net=hysteria2
             is_protocol=$net
             [[ ! $password ]] && password=$uuid
-            json_str="users:[{password:\"$password\"}],$is_tls_json"
+            local hy2_tls_json="$is_tls_json"
+            if [[ $is_hy2_add_cert && $is_hy2_add_key ]]; then
+                local hy2_sni_part=""
+                [[ $is_hy2_add_sni ]] && hy2_sni_part="server_name:\"$is_hy2_add_sni\","
+                hy2_tls_json="tls:{enabled:true,alpn:[\"h3\"],${hy2_sni_part}key_path:\"$is_hy2_add_key\",certificate_path:\"$is_hy2_add_cert\"}"
+                is_hy2_cert=$is_hy2_add_cert
+                is_servername=$is_hy2_add_sni
+            fi
+            json_str="users:[{password:\"$password\"}],$hy2_tls_json"
+            if [[ $is_hy2_add_obfs ]]; then
+                json_str="$json_str,obfs:{type:\"salamander\",password:\"$is_hy2_add_obfs\"}"
+                is_hy2_obfs_type=salamander
+                is_hy2_obfs_pass=$is_hy2_add_obfs
+            fi
+            if [[ $is_hy2_add_masquerade ]]; then
+                json_str="$json_str,masquerade:\"$is_hy2_add_masquerade\""
+                is_hy2_masquerade=$is_hy2_add_masquerade
+            fi
             ;;
         shadowsocks*)
             net=ss
@@ -1312,6 +1659,9 @@ get() {
         is_host_dns=$(_wget -qO- --header="accept: application/dns-json" "https://one.one.one.one/dns-query?name=$host&type=$is_dns_type")
         ;;
     install-caddy)
+        if is_external_caddy; then
+            err "检测到系统已存在非本脚本管理的 Caddy / Caddyfile，已禁止安装或覆写。"
+        fi
         _green "\n安装 Caddy 实现自动配置 TLS.\n"
         load download.sh
         download caddy
@@ -1375,7 +1725,7 @@ info() {
     ws | tcp | h2 | quic | http*)
         if [[ $host ]]; then
             is_color=45
-            is_can_change=(0 1 2 3 5)
+            is_can_change=(0 1 2 3 5 13)
             is_info_show=(0 1 2 3 4 6 7 8)
             [[ $is_protocol == 'vmess' ]] && {
                 is_vmess_url=$(jq -c '{v:2,ps:'\"233boy-$net-$host\"',add:'\"$is_addr\"',port:'\"$is_https_port\"',id:'\"$uuid\"',aid:"0",net:'\"$net\"',host:'\"$host\"',path:'\"$path\"',tls:'\"tls\"'}' <<<{})
@@ -1384,7 +1734,7 @@ info() {
                 [[ $is_protocol == "trojan" ]] && {
                     uuid=$password
                     # is_info_str=($is_protocol $is_addr $is_https_port $password $net $host $path 'tls')
-                    is_can_change=(0 1 2 3 4)
+                    is_can_change=(0 1 2 3 4 13)
                     is_info_show=(0 1 2 10 4 6 7 8)
                 }
                 is_url="$is_protocol://$uuid@$host:$is_https_port?encryption=none&security=tls&type=$net&host=$host&path=$path#233boy-$net-$host"
@@ -1393,7 +1743,7 @@ info() {
             is_info_str=($is_protocol $is_addr $is_https_port $uuid $net $host $path 'tls')
         else
             is_type=none
-            is_can_change=(0 1 5)
+            is_can_change=(0 1 5 13)
             is_info_show=(0 1 2 3 4)
             is_info_str=($is_protocol $is_addr $port $uuid $net)
             [[ $net == "http" ]] && {
@@ -1414,36 +1764,65 @@ info() {
         fi
         ;;
     ss)
-        is_can_change=(0 1 4 6)
+        is_can_change=(0 1 4 6 13)
         is_info_show=(0 1 2 10 11)
         is_url="ss://$(echo -n ${ss_method}:${ss_password} | base64 -w 0)@${is_addr}:${port}#233boy-$net-${is_addr}"
         is_info_str=($is_protocol $is_addr $port $ss_password $ss_method)
         ;;
     trojan)
         is_insecure=1
-        is_can_change=(0 1 4)
+        is_can_change=(0 1 4 13)
         is_info_show=(0 1 2 10 4 8 20)
         is_url="$is_protocol://$password@$is_addr:$port?type=tcp&security=tls&insecure=1&allowInsecure=1#233boy-$net-$is_addr"
         is_info_str=($is_protocol $is_addr $port $password tcp tls true)
         ;;
     hy*)
-        is_can_change=(0 1 4)
-        is_info_show=(0 1 2 10 8 9 20)
-        # fix xray core for client use.
-        is_sha256=$(openssl x509 -noout -fingerprint -sha256 -in $is_core_dir/bin/tls.cer | sed 's/.*=//;s/://g')
-        is_url="$is_protocol://$password@$is_addr:$port?alpn=h3&insecure=1&allowInsecure=1&pinSHA256=$is_sha256#233boy-$net-$is_addr"
-        is_info_str=($is_protocol $is_addr $port $password tls h3 "true (设置, 固定证书>证书指纹(SHA-256): $is_sha256)")
+        is_can_change=(0 1 4 14 15 11 16 13)
+        if [[ ! $is_hy2_cert || $is_hy2_cert == "$is_core_dir/bin/tls.cer" ]]; then
+            is_insecure=1
+            is_info_show=(0 1 2 10 8 9 20)
+            is_sha256=$(openssl x509 -noout -fingerprint -sha256 -in "$is_core_dir/bin/tls.cer" 2>/dev/null | sed 's/.*=//;s/://g')
+            is_url="$is_protocol://$password@$is_addr:$port?alpn=h3&insecure=1&allowInsecure=1&pinSHA256=$is_sha256"
+            is_info_str=("$is_protocol" "$is_addr" "$port" "$password" tls h3 "true (设置, 固定证书>证书指纹(SHA-256): $is_sha256)")
+        else
+            is_insecure=
+            is_info_show=(0 1 2 10 8 9 27)
+            is_url="$is_protocol://$password@$is_addr:$port?alpn=h3"
+            is_info_str=("$is_protocol" "$is_addr" "$port" "$password" tls h3 "$is_hy2_cert")
+            if [[ $is_servername ]]; then
+                is_info_show+=(16)
+                is_info_str+=("$is_servername")
+                is_url+="&sni=$is_servername"
+            fi
+        fi
+        if [[ $is_hy2_obfs_type == "salamander" && $is_hy2_obfs_pass ]]; then
+            is_info_show+=(22)
+            is_info_str+=("salamander ($is_hy2_obfs_pass)")
+            is_url+="&obfs=salamander&obfs-password=$is_hy2_obfs_pass"
+        fi
+        load hy2.sh
+        is_hy2_hop=$(hy2_get_hopping_range "$port")
+        if [[ $is_hy2_hop ]]; then
+            is_info_show+=(23)
+            is_info_str+=("${is_hy2_hop} -> ${port}")
+            is_url+="&mport=$is_hy2_hop"
+        fi
+        if [[ $is_hy2_masquerade ]]; then
+            is_info_show+=(24)
+            is_info_str+=("$is_hy2_masquerade")
+        fi
+        is_url+="#233boy-$net-$is_addr"
         ;;
     tuic)
         is_insecure=1
-        is_can_change=(0 1 4 5)
+        is_can_change=(0 1 4 5 13)
         is_info_show=(0 1 2 3 10 8 9 20 21)
         is_url="$is_protocol://$uuid:$password@$is_addr:$port?alpn=h3&insecure=1&allowInsecure=1&congestion_control=bbr#233boy-$net-$is_addr"
         is_info_str=($is_protocol $is_addr $port $uuid $password tls h3 true bbr)
         ;;
     reality)
         is_color=41
-        is_can_change=(0 1 5 9 10)
+        is_can_change=(0 1 5 9 10 13)
         is_info_show=(0 1 2 3 15 4 8 16 17 18)
         is_flow=xtls-rprx-vision
         is_net_type=tcp
@@ -1453,10 +1832,16 @@ info() {
             is_info_show=(${is_info_show[@]/15/})
         }
         is_info_str=($is_protocol $is_addr $port $uuid $is_flow $is_net_type reality $is_servername chrome $is_public_key)
-        is_url="$is_protocol://$uuid@$is_addr:$port?encryption=none&security=reality&flow=$is_flow&type=$is_net_type&sni=$is_servername&pbk=$is_public_key&fp=chrome#233boy-$net-$is_addr"
+        is_url="$is_protocol://$uuid@$is_addr:$port?encryption=none&security=reality&flow=$is_flow&type=$is_net_type&sni=$is_servername&pbk=$is_public_key&fp=chrome"
+        if [[ $is_reality_sid ]]; then
+            is_info_show+=(28)
+            is_info_str+=("$is_reality_sid")
+            is_url+="&sid=$is_reality_sid"
+        fi
+        is_url+="#233boy-$net-$is_addr"
         ;;
     anytls)
-        is_can_change=(0 1 4)
+        is_can_change=(0 1 4 13)
         if [[ $is_anytls_domain ]]; then
             is_info_show=(0 1 2 10 8)
             is_info_str=($is_protocol $is_anytls_domain $port $password tls)
@@ -1469,17 +1854,25 @@ info() {
         fi
         ;;
     direct)
-        is_can_change=(0 1 7 8)
+        is_can_change=(0 1 7 8 13)
         is_info_show=(0 1 2 13 14)
         is_info_str=($is_protocol $is_addr $port $door_addr $door_port)
         ;;
     socks)
-        is_can_change=(0 1 12 4)
+        is_can_change=(0 1 12 4 13)
         is_info_show=(0 1 2 19 10)
         is_info_str=($is_protocol $is_addr $port $is_socks_user $is_socks_pass)
         is_url="socks://$(echo -n ${is_socks_user}:${is_socks_pass} | base64 -w 0)@${is_addr}:${port}#233boy-$net-${is_addr}"
         ;;
     esac
+    if [[ $is_chain_summary ]]; then
+        is_info_show+=(25)
+        is_info_str+=("$is_chain_summary")
+    fi
+    if [[ $is_chain_bypass ]]; then
+        is_info_show+=(26)
+        is_info_str+=("$is_chain_bypass")
+    fi
     [[ $is_dont_show_info || $is_gen || $is_dont_auto_exit ]] && return # dont show info
     msg "-------------- $is_config_name -------------"
     for ((i = 0; i < ${#is_info_show[@]}; i++)); do
@@ -1697,6 +2090,22 @@ main() {
     c | config | change)
         change ${@:2}
         ;;
+    chain)
+        load chain.sh
+        chain_set "$2" "$3" "$4"
+        ;;
+    obfs | hy2-obfs)
+        load hy2.sh
+        hy2_set_obfs "$2" "$3"
+        ;;
+    cert)
+        load hy2.sh
+        hy2_set_cert "$2" "$3" "$4" "$5"
+        ;;
+    hop | hopping | mport)
+        load hy2.sh
+        hy2_set_hop "$2" "$3"
+        ;;
     # client | genc)
     #     create client $2
     #     ;;
@@ -1750,6 +2159,9 @@ main() {
         create config.json
         ;;
     fix-caddyfile)
+        if is_external_caddy; then
+            err "检测到现有 Caddyfile 非本脚本生成（可能为独立业务网关），已禁止执行 fix-caddyfile。"
+        fi
         if [[ $is_caddy ]]; then
             load caddy.sh
             caddy_config new

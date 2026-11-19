@@ -1,7 +1,15 @@
+is_script_caddyfile() {
+    [[ ! -e $is_caddyfile || ! -s $is_caddyfile ]] && return 0
+    grep -qE "^# don't edit this file #$|^# 不要编辑这个文件 #$|233boy\.com/.*/caddy-auto-tls/" "$is_caddyfile"
+}
+
 caddy_config() {
     is_caddy_site_file=$is_caddy_conf/${host}.conf
     case $1 in
     new)
+        if ! is_script_caddyfile; then
+            err "检测到现有 Caddyfile 非本脚本生成（可能为独立业务网关），已禁止覆写: $is_caddyfile"
+        fi
         mkdir -p $is_caddy_dir $is_caddy_dir/sites $is_caddy_conf
         cat >$is_caddyfile <<-EOF
 # don't edit this file #
@@ -51,7 +59,7 @@ reverse_proxy https://$proxy_site {
 }"
         ;;
     esac
-    [[ $1 != "new" && $1 != 'proxy' ]] && {
+    if [[ $1 != "new" && $1 != 'proxy' ]]; then
         [[ ! -f ${is_caddy_site_file}.add ]] && echo "# see https://233boy.com/$is_core/caddy-auto-tls/" >${is_caddy_site_file}.add
-    }
+    fi
 }

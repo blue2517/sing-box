@@ -12,7 +12,8 @@
 - 兼容 sing-box 命令
 - 强大的快捷参数
 - 支持所有常用协议
-- 一键添加 VLESS-REALITY (默认)
+- 首次安装自选协议，无默认类型
+- 一键添加 VLESS-REALITY
 - 一键添加 TUIC
 - 一键添加 Trojan
 - 一键添加 Hysteria2
@@ -42,6 +43,8 @@
 脚本的参数非常高效率并且超级易用，请掌握参数的使用
 
 # 文档
+
+本 fork 的脚本安装及更新源为 `blue2517/sing-box`；sing-box 内核仍从 `SagerNet/sing-box` 下载。
 
 安装及使用：https://233boy.com/sing-box/sing-box-script/
 
